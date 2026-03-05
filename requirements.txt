@@ -1,0 +1,8 @@
+markitdown[pptx]
+markitdown[docx]
+markitdown[xlsx]
+markitdown[xls]
+markitdown[pdf]
+markitdown[outlook]
+markitdown[audio-transcription]
+markitdown[youtube-transcription]
