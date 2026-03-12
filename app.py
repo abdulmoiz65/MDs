@@ -1,10 +1,15 @@
 import argparse
-import base64
 import os
+import posixpath
 import re
 import sys
+import warnings
 import zipfile
 import xml.etree.ElementTree as ET
+
+# pydub (pulled in by markitdown[audio-transcription]) warns about ffmpeg on
+# import even though we use faster-whisper which needs no ffmpeg at all.
+warnings.filterwarnings("ignore", category=RuntimeWarning, module="pydub")
 
 from markitdown import MarkItDown
 
@@ -22,13 +27,21 @@ _EXT_NORM = {
     "wmf": ".wmf",
 }
 
-# Regex: matches BOTH proper base64 data-URIs  AND  the stub "base64..." that
-# MarkItDown writes when it can't embed the actual bytes.
+# Matches the stub "base64..." placeholders MarkItDown writes for docx/xlsx
+# when it can't embed actual image bytes.
 #   group 1 = alt text
-#   group 2 = mime subtype  (e.g. "png", "x-emf")
-#   group 3 = everything after "base64"  (could be ",<data>" or "...")
 _IMG_PLACEHOLDER_RE = re.compile(
-    r'!\[([^\]]*)\]\(data:image/([^;]+);base64([^)]*)\)'
+    r'!\[([^\]]*)\]\(data:image/[^;]+;base64[^)]*\)'
+)
+
+# Matches the plain-filename image refs MarkItDown writes for pptx, e.g.:
+#   ![](Picture5.jpg)  or  ![some alt](image1.png)
+# Only matches bare filenames (no directory separator) with image extensions.
+#   group 1 = alt text
+#   group 2 = filename
+_PPTX_IMG_RE = re.compile(
+    r'!\[([^\]]*)\]\(([^/\)]+\.(?:png|jpe?g|gif|bmp|webp|tiff?|svg|emf|wmf))\)',
+    re.IGNORECASE,
 )
 
 # XML namespaces used in Office Open XML
@@ -90,10 +103,7 @@ SUPPORTED_EXTENSIONS = {
     "docx", "doc",          # Word
     "xlsx",                 # Excel (modern)
     "xls",                  # Excel (legacy)
-    "pdf",                  # PDF
-    "msg",                  # Outlook messages
     "wav", "mp3",           # Audio — handled by faster-whisper (no ffmpeg needed)
-    "html", "htm",          # Web
     "csv", "json", "xml",   # Data formats
     "epub", "zip",          # Other
 }
@@ -183,12 +193,13 @@ def _rels_to_image_map(zf: zipfile.ZipFile, rels_path: str) -> dict:
             rid = rel.get("Id")
             target = rel.get("Target", "")
             # Target is relative to the folder containing the .rels file
-            # e.g.  rels_path = "word/_rels/document.xml.rels"
-            # so base = "word/"
+            # e.g.  rels_path = "ppt/slides/_rels/slide1.xml.rels"
+            # so base = "ppt/slides/"
             base = rels_path.replace("_rels/", "").rsplit("/", 1)[0] + "/"
-            # Normalise  "media/image1.png"  →  "word/media/image1.png"
             if not target.startswith("/"):
-                full = base + target
+                # posixpath.normpath resolves ".." segments, e.g.:
+                # "ppt/slides/" + "../media/image1.png" → "ppt/media/image1.png"
+                full = posixpath.normpath(base + target)
             else:
                 full = target.lstrip("/")
             mapping[rid] = full
@@ -353,22 +364,10 @@ def extract_and_save_images(
     input_path: str | None = None,
 ) -> str:
     """
-    Replace every ``![alt](data:image/...;base64...)`` placeholder in
-    *markdown_content* with a link to a real saved image file.
-
-    Strategy
-    --------
-    A)  If *input_path* is a zip-based Office file (docx/pptx/xlsx) the images
-        are extracted directly from the zip in document order and matched to the
-        placeholders positionally — this is necessary because MarkItDown writes
-        stub placeholders ("base64...") without the actual bytes.
-
-    B)  Otherwise (e.g. HTML) decode the embedded base64 blob and save it.
+    Replace every ``![alt](data:image/...;base64...)`` stub placeholder that
+    MarkItDown writes for Office zip formats (docx/pptx/xlsx) with a link to
+    a real saved image file extracted directly from the zip archive.
     """
-    placeholders = list(_IMG_PLACEHOLDER_RE.finditer(markdown_content))
-    if not placeholders:
-        return markdown_content
-
     stem = os.path.splitext(output_path)[0]
     images_dir = stem + "_images"
     md_dir = os.path.dirname(os.path.abspath(output_path))
@@ -381,65 +380,71 @@ def extract_and_save_images(
         and input_path.rsplit(".", 1)[-1].lower() in zip_exts
     )
 
+    ext_lower = input_path.rsplit(".", 1)[-1].lower() if use_zip else ""
+
+    # pptx: MarkItDown writes bare filenames  ![](Picture5.jpg)  — use dedicated regex.
+    # xlsx: MarkItDown produces NO placeholders at all (pandas reads the sheet).
+    # Both need special handling so we don't bail out early.
+    is_pptx  = use_zip and ext_lower in {"pptx", "ppt"}
+    is_xlsx  = use_zip and ext_lower in {"xlsx", "xls"}
+
+    # Pick the right placeholder regex for this format
+    if is_pptx:
+        placeholders = list(_PPTX_IMG_RE.finditer(markdown_content))
+    else:
+        placeholders = list(_IMG_PLACEHOLDER_RE.finditer(markdown_content))
+
+    if not placeholders and not is_xlsx:
+        return markdown_content
+
     if use_zip:
         body_imgs, orphan_imgs = _extract_images_from_zip(input_path, images_dir)
         updated = markdown_content
 
-        # Replace in-body placeholders with real image paths
+        # Replace in-body placeholders with real image paths (positional match)
         for m, img_path in zip(placeholders, body_imgs):
             img_path = _convert_to_png(img_path)          # EMF/WMF → PNG
             rel = os.path.relpath(img_path, md_dir).replace("\\", "/")
+            rel_encoded = rel.replace(" ", "%20")
             alt = m.group(1)
-            updated = updated.replace(m.group(0), f"![{alt}]({rel})", 1)
+            updated = updated.replace(m.group(0), f"![{alt}]({rel_encoded})", 1)
             print(f"  [IMG] Saved {rel}")
 
         # Append header/footer/orphan images at the bottom of the markdown
         if orphan_imgs:
-            lines = ["\n\n---\n\n## Additional Images\n\n"
-                     "> *These images appear in the document's headers, "
-                     "footers, or embedded objects.*\n"]
+            if is_xlsx:
+                header = "\n\n---\n\n## Sheet Images\n\n"
+            else:
+                header = (
+                    "\n\n---\n\n## Additional Images\n\n"
+                    "> *These images appear in the document's headers, "
+                    "footers, or embedded objects.*\n"
+                )
+            lines = [header]
             for img_path in orphan_imgs:
                 img_path = _convert_to_png(img_path)      # EMF/WMF → PNG
                 rel = os.path.relpath(img_path, md_dir).replace("\\", "/")
-                lines.append(f"\n![{os.path.basename(img_path)}]({rel})\n")
+                rel_encoded = rel.replace(" ", "%20")
+                lines.append(f"\n![{os.path.basename(img_path)}]({rel_encoded})\n")
                 print(f"  [IMG] Appended (header/footer) {rel}")
             updated += "".join(lines)
 
         return updated
 
-    # --- Strategy B: real base64 blobs (e.g. HTML conversion) ---
-    os.makedirs(images_dir, exist_ok=True)
-    updated = markdown_content
-    for counter, m in enumerate(placeholders, start=1):
-        alt_text = m.group(1)
-        mime_sub = m.group(2)
-        after_base64 = m.group(3)  # either ",<data>" or "..."
+    # Non-zip format with no placeholders — nothing to do
+    return markdown_content
 
-        if not after_base64.startswith(","):
-            continue  # stub with no real data — skip
 
-        b64_data = after_base64[1:].strip()
-        if not b64_data:
-            continue
-
-        raw_ext = mime_sub.lower().split("/")[-1]
-        norm_ext = _EXT_NORM.get(raw_ext, f".{raw_ext}")
-        img_filename = f"image_{counter:03d}{norm_ext}"
-        img_path = os.path.join(images_dir, img_filename)
-
-        try:
-            img_bytes = base64.b64decode(b64_data)
-            with open(img_path, "wb") as fh:
-                fh.write(img_bytes)
-        except Exception as exc:
-            print(f"[WARN] Could not save {img_filename}: {exc}", file=sys.stderr)
-            continue
-
-        rel = os.path.relpath(img_path, md_dir).replace("\\", "/")
-        updated = updated.replace(m.group(0), f"![{alt_text}]({rel})", 1)
-        print(f"  [IMG] Saved {rel}")
-
-    return updated
+def _clean_xlsx_markdown(content: str) -> str:
+    """
+    Post-process MarkItDown's xlsx output:
+    - Replace NaN cells (empty Excel cells rendered by pandas) with blank.
+    - Replace 'Unnamed: N' column headers (pandas auto-names for merged/blank
+      header columns) with blank, so the table looks clean.
+    """
+    content = re.sub(r'(?<=\|)\s*NaN\s*(?=\|)', ' ', content)
+    content = re.sub(r'(?<=\|)\s*Unnamed:\s*\d+\s*(?=\|)', ' ', content)
+    return content
 
 
 def convert_path_to_markdown(input_path: str):
@@ -457,7 +462,11 @@ def convert_path_to_markdown(input_path: str):
     try:
         md = MarkItDown(enable_plugins=False)
         result = md.convert(input_path)
-        return result.text_content, None
+        content = result.text_content
+        # Clean up pandas artefacts in xlsx/xls output
+        if ext in {"xlsx", "xls"}:
+            content = _clean_xlsx_markdown(content)
+        return content, None
     except Exception as exc:
         return "", str(exc)
 
@@ -465,23 +474,22 @@ def convert_path_to_markdown(input_path: str):
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="office_to_markdown",
-        description="Convert Office documents, PDFs, audio, and YouTube URLs to Markdown.",
+        description="Convert Office documents, audio, and YouTube URLs to Markdown.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Supported file types:\n"
-            "  Documents   : docx, doc, pdf, epub\n"
+            "  Documents   : docx, doc, epub\n"
             "  Spreadsheets: xlsx, xls\n"
             "  Presentations: pptx, ppt\n"
-            "  Outlook     : msg\n"
             "  Audio       : wav, mp3  (faster-whisper, no ffmpeg needed)\n"
-            "  Web / Other : html, htm, csv, json, xml, zip\n"
+            "  Data        : csv, json, xml\n"
+            "  Other       : epub, zip\n"
             "  YouTube URL : https://www.youtube.com/watch?v=...\n"
+            "\nNOTE: For Outlook .msg files use outlook_to_md.py instead.\n"
             "\nExamples:\n"
             "  python app.py report.docx\n"
             "  python app.py slides.pptx --output slides.md\n"
             "  python app.py data.xlsx --output data.md\n"
-            "  python app.py invoice.pdf\n"
-            "  python app.py meeting.msg\n"
             "  python app.py recording.mp3\n"
             "  python app.py https://www.youtube.com/watch?v=dQw4w9WgXcQ\n"
         ),

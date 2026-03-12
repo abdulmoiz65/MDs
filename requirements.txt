@@ -1,8 +1,21 @@
+# app.py — Office / audio / YouTube → Markdown
 markitdown[pptx]
 markitdown[docx]
 markitdown[xlsx]
 markitdown[xls]
-markitdown[pdf]
-markitdown[outlook]
 markitdown[audio-transcription]
 markitdown[youtube-transcription]
+faster-whisper
+
+# outlook_to_md.py — Outlook .msg → Markdown
+extract-msg
+html2text
+
+# RTFtoMD.py — RTF → Markdown
+striprtf
+
+# pdf_to_md_converter.py — PDF → Markdown
+pymupdf
+pymupdf4llm
+Pillow
+PyYAML

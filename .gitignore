@@ -1,1 +1,6 @@
 assets/
+RTFS/
+pycache/
+__pycache__/
+converted/
+converted_pdfs/
